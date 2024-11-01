@@ -149,31 +149,30 @@ void Animations::update(UserCmd* cmd, bool& _sendPacket) noexcept
     updatingLocal = false;
 }
 
-void Animations::fake() noexcept
+void Animations::fake() noexcept // My new fix + improvements -FemboyLucky
 {
     static AnimState* fakeAnimState = nullptr;
     static bool updateFakeAnim = true;
     static bool initFakeAnim = true;
-    static float spawnTime = 0.f;
+    static float lastSpawnTime = 0.f;
 
-    if (!localPlayer || !localPlayer->isAlive() || !localPlayer->getAnimstate())
+    if (!localPlayer || !localPlayer->isAlive() || !localPlayer->getAnimstate() || interfaces->engine->isHLTV())
         return;
 
-    if (interfaces->engine->isHLTV())
-        return;
-
-    if (spawnTime != localPlayer->spawnTime() || updateFakeAnim)
+    // Check for respawn or forced animation update
+    if (lastSpawnTime != localPlayer->spawnTime() || updateFakeAnim)
     {
-        spawnTime = localPlayer->spawnTime();
+        lastSpawnTime = localPlayer->spawnTime();
         initFakeAnim = false;
         updateFakeAnim = false;
     }
 
+    // Initialize fake animation state if needed
     if (!initFakeAnim)
     {
         fakeAnimState = static_cast<AnimState*>(memory->memalloc->Alloc(sizeof(AnimState)));
 
-        if (fakeAnimState != nullptr)
+        if (fakeAnimState)
             localPlayer->createState(fakeAnimState);
 
         initFakeAnim = true;
@@ -186,15 +185,20 @@ void Animations::fake() noexcept
     {
         updatingFake = true;
 
+        // Backup current animation layers and state
         std::array<AnimationLayer, 13> layers;
-
         std::memcpy(&layers, localPlayer->animOverlays(), sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
-        const auto backupAbs = localPlayer->getAbsAngle();
-        const auto backupPoses = localPlayer->poseParameters();
 
+        const auto backupAbsAngle = localPlayer->getAbsAngle();
+        const auto backupPoseParams = localPlayer->poseParameters();
+
+        // Update the fake animation state
         localPlayer->updateState(fakeAnimState, viewangles);
-        if (fabsf(fakeAnimState->footYaw - footYaw) <= 5.f)
+
+        // Check if the yaw difference is within a threshold
+        if (std::fabs(fakeAnimState->footYaw - footYaw) <= 5.f)
         {
+            // Restore animation state and avoid updating bones
             gotMatrix = false;
             updatingFake = false;
 
@@ -204,36 +208,43 @@ void Animations::fake() noexcept
 
             gotMatrixFakelag = localPlayer->setupBones(fakelagmatrix.data(), localPlayer->getBoneCache().size, 0x7FF00, memory->globalVars->currenttime);
 
+            // Restore animation layers and poses
             std::memcpy(localPlayer->animOverlays(), &layers, sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
-            localPlayer->poseParameters() = backupPoses;
-            memory->setAbsAngle(localPlayer.get(), Vector{ 0,backupAbs.y,0 });
+            localPlayer->poseParameters() = backupPoseParams;
+            memory->setAbsAngle(localPlayer.get(), Vector{ 0, backupAbsAngle.y, 0 });
             return;
         }
+
+        // Update absolute angle and generate fake matrix
         memory->setAbsAngle(localPlayer.get(), Vector{ 0, fakeAnimState->footYaw, 0 });
         std::memcpy(localPlayer->animOverlays(), &layers, sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
         localPlayer->getAnimationLayer(ANIMATION_LAYER_LEAN)->weight = std::numeric_limits<float>::epsilon();
 
         gotMatrix = localPlayer->setupBones(fakematrix.data(), localPlayer->getBoneCache().size, 0x7FF00, memory->globalVars->currenttime);
         gotMatrixFakelag = gotMatrix;
+
         if (gotMatrix)
         {
+            // Adjust fakelag matrix origin and copy bones
             std::copy(fakematrix.begin(), fakematrix.end(), fakelagmatrix.data());
             const auto origin = localPlayer->getRenderOrigin();
-            for (auto& i : fakematrix)
+            for (auto& matrix : fakematrix)
             {
-                i[0][3] -= origin.x;
-                i[1][3] -= origin.y;
-                i[2][3] -= origin.z;
+                matrix[0][3] -= origin.x;
+                matrix[1][3] -= origin.y;
+                matrix[2][3] -= origin.z;
             }
         }
 
+        // Restore layers, poses, and absolute angle
         std::memcpy(localPlayer->animOverlays(), &layers, sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
-        localPlayer->poseParameters() = backupPoses;
-        memory->setAbsAngle(localPlayer.get(), Vector{ 0,backupAbs.y,0 });
+        localPlayer->poseParameters() = backupPoseParams;
+        memory->setAbsAngle(localPlayer.get(), Vector{ 0, backupAbsAngle.y, 0 });
 
         updatingFake = false;
     }
 }
+
 
 void Animations::renderStart(FrameStage stage) noexcept
 {
@@ -428,51 +439,69 @@ void Animations::handlePlayers(FrameStage stage) noexcept
 
             //Run animations
 
+            // Update entity animation state - The old animation state update was bit clunky so here's my improvemnt. - FemboyLucky
             updatingEntity = true;
-            if (player.chokedPackets <= 0) //We dont need to simulate commands
-            {
-                if (entity->getAnimstate()->lastUpdateFrame == memory->globalVars->framecount)
-                    entity->getAnimstate()->lastUpdateFrame -= 1;
+           
+            if (player.chokedPackets <= 0) {
+                // Handle normal update case
+                auto* animState = entity->getAnimstate();
+                if (animState) {  // Add null check
+                    if (animState->lastUpdateFrame == memory->globalVars->framecount)
+                        animState->lastUpdateFrame--;
+                    if (animState->lastUpdateTime == memory->globalVars->currenttime)
+                        animState->lastUpdateTime += ticksToTime(1);
+                }
 
-                if (entity->getAnimstate()->lastUpdateTime == memory->globalVars->currenttime)
-                    entity->getAnimstate()->lastUpdateTime += ticksToTime(1);
-
-                entity->getEFlags() &= ~0x1000;
+                constexpr uint32_t EFL_DIRTY_ABSVELOCITY = 0x1000;
+                entity->getEFlags() &= ~EFL_DIRTY_ABSVELOCITY;
                 entity->getAbsVelocity() = player.velocity;
                 entity->updateClientSideAnimation();
             }
-            else
-            {
-                //Simulate missing ticks
-                //TODO: Improve this drastically
-                for (int i = 1; i <= player.chokedPackets + 1; i++)
-                {
-                    const float simulatedTime = player.simulationTime + (memory->globalVars->intervalPerTick * i);
-                    const float lerpValue = 1.f - (entity->simulationTime() - simulatedTime) / (entity->simulationTime() - player.simulationTime);
-                    const float currentTimeBackup = memory->globalVars->currenttime;
+            else {
+                // Simulate missing ticks
+                const float baseSimTime = player.simulationTime;
+                const float intervalTick = memory->globalVars->intervalPerTick;
+                const float currentTimeBackup = memory->globalVars->currenttime;
+                constexpr uint32_t EFL_DIRTY_ABSVELOCITY = 0x1000;
+
+                // Simulate each tick
+                for (int i = 1; i <= player.chokedPackets + 1; ++i) {
+                    const float simulatedTime = baseSimTime + intervalTick * i;
+                    float lerpValue = 1.0f;
+
+                    if (entity->simulationTime() != baseSimTime) {
+                        lerpValue = 1.0f - (entity->simulationTime() - simulatedTime) /
+                            (entity->simulationTime() - baseSimTime);
+                        lerpValue = std::clamp(lerpValue, 0.0f, 1.0f);  // Ensure valid range
+                    }
 
                     memory->globalVars->currenttime = simulatedTime;
+                    entity->getEFlags() &= ~EFL_DIRTY_ABSVELOCITY;
 
-                    entity->getEFlags() &= ~0x1000;
+                    // Update entity state with interpolated values
                     entity->getAbsVelocity() = Helpers::lerp(lerpValue, player.velocity, player.oldVelocity);
                     entity->duckAmount() = Helpers::lerp(lerpValue, player.duckAmount, player.oldDuckAmount);
 
-                    if (entity->getAnimstate()->lastUpdateFrame == memory->globalVars->framecount)
-                        entity->getAnimstate()->lastUpdateFrame -= 1;
+                    // Update animation state
+                    auto* animState = entity->getAnimstate();
+                    if (animState) {  // Add null check
+                        if (animState->lastUpdateFrame == memory->globalVars->framecount)
+                            animState->lastUpdateFrame--;
+                        if (animState->lastUpdateTime == memory->globalVars->currenttime)
+                            animState->lastUpdateTime += ticksToTime(1);
 
-                    if (entity->getAnimstate()->lastUpdateTime == memory->globalVars->currenttime)
-                        entity->getAnimstate()->lastUpdateTime += ticksToTime(1);
-
-                    entity->updateClientSideAnimation();
-
-                    memory->globalVars->currenttime = currentTimeBackup;
+                        entity->updateClientSideAnimation();
+                    }
                 }
-                entity->getEFlags() &= ~0x1000;
+
+                // Restore time and set final entity state
+                memory->globalVars->currenttime = currentTimeBackup;
+                entity->getEFlags() &= ~EFL_DIRTY_ABSVELOCITY;
                 entity->getAbsVelocity() = player.velocity;
                 entity->duckAmount() = player.duckAmount;
             }
-            updatingEntity = false;
 
+            updatingEntity = false;
             Resolver::runPostUpdate(player, entity);
 
             //Fix jump pose

@@ -37,5 +37,7 @@ namespace Resolver
 		float time{ -1 };
 		int playerIndex{ -1 };
 		int backtrackRecord{ -1 };
+		#define MAX_DESYNC_THRESHOLD 58.0f  // Example threshold, adjust as needed
+		#define DESYNC_SCALE_FACTOR 1.5f    // Example scale factor, adjust as needed
 	};
 }
