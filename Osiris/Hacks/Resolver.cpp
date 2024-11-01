@@ -1,13 +1,16 @@
 ﻿#include "hitscan.h"
 #include "Animations.h"
 #include "Resolver.h"
-
+#include "../SDK/ConVar.h"
 #include "../Logger.h"
 
 #include "../SDK/GameEvent.h"
 #include "../Vector2D.hpp"
 #include <DirectXMath.h>
 #include <algorithm>
+#include <cmath>
+#include <vector>
+#include <tuple>
 #include "Backtrack.h"
 std::deque<Resolver::SnapShot> snapshots;
 static std::array<Animations::Players, 65> players{};
@@ -132,9 +135,11 @@ float get_backward_side(Entity* entity) {
     const float result = Helpers::angleDiff(localPlayer->origin().y, entity->origin().y);
     return result;
 }
+
 float get_angle(Entity* entity) {
     return Helpers::angleNormalize(entity->eyeAngles().y);
 }
+
 float get_forward_yaw(Entity* entity) {
     return Helpers::angleNormalize(get_backward_side(entity) - 180.f);
 }
@@ -258,65 +263,81 @@ int GetChokedPackets(Entity* entity) {
         return ticks;
     }
 }
-void Resolver::resolve_entity(const Animations::Players& player, Entity* entity) {
-    // get the players max rotation.
-    //fix
-    if (DesyncDetect(entity) == false)
+
+void Resolver::resolve_entity(const Animations::Players & player, Entity * entity) {
+    // Check if desync is detected
+    if (!DesyncDetect(entity))
         return;
+
+    // Get the player's max rotation and eye yaw
     float max_rotation = entity->getMaxDesyncAngle();
-    int index = 0;
     const float eye_yaw = entity->getAnimstate()->eyeYaw;
-    if (!player.extended && fabs(max_rotation) > 60.f)
-    {
+
+    // Adjust max rotation based on player's extended status
+    // This is done to account for the difference in max rotation between extended and non-extended players
+    if (!player.extended && fabs(max_rotation) > 60.f) {
         max_rotation = max_rotation / 1.8f;
     }
 
-    // resolve shooting players separately.
+    // Resolve shooting players separately
+    // Shooting players require a different resolution strategy, so they are handled separately
     if (player.shot) {
         entity->getAnimstate()->footYaw = eye_yaw + resolve_shot(player, entity);
         return;
     }
+
+    int index = 0;
+    // If player's velocity is low, calculate index based on angle difference
+    // When the player's velocity is low, the angle difference between the eye yaw and foot yaw can be used to determine the player's direction
     if (entity->velocity().length2D() <= 2.5f) {
         const float angle_difference = Helpers::angleDiff(eye_yaw, entity->getAnimstate()->footYaw);
-        index = 2 * angle_difference <= 0.0f ? 1 : -1;
+        index = (2 * angle_difference <= 0.0f) ? 1 : -1;
     }
-    else
-    {
+    // If player's velocity is high, calculate index based on layer delta values
+    // When the player's velocity is high, the delta values between the animation layers can be used to determine the player's direction
+    else {
         if (!static_cast<int>(player.layers[12].weight * 1000.f) && entity->velocity().length2D() > 3.f) {
-            const auto m_layer_delta1 = abs(player.layers[6].playbackRate - player.oldlayers[6].playbackRate);
-            const auto m_layer_delta2 = abs(player.layers[6].playbackRate - player.oldlayers[6].playbackRate);
+            float layer_delta1 = abs(player.layers[6].playbackRate - player.oldlayers[6].playbackRate);
+            float layer_delta2 = abs(player.layers[7].playbackRate - player.oldlayers[7].playbackRate);
+            float layer_delta3 = abs(player.layers[8].playbackRate - player.oldlayers[8].playbackRate);
 
-            if (const auto m_layer_delta3 = abs(player.layers[6].playbackRate - player.oldlayers[6].playbackRate); m_layer_delta1 < m_layer_delta2
-                || m_layer_delta3 <= m_layer_delta2
-                || static_cast<signed int>((m_layer_delta2 * 1000.0f)))
-            {
-                if (m_layer_delta1 >= m_layer_delta3
-                    && m_layer_delta2 > m_layer_delta3
-                    && !static_cast<signed int>((m_layer_delta3 * 1000.0f)))
-                {
+            if (layer_delta1 < layer_delta2 || layer_delta3 <= layer_delta2 || static_cast<signed int>((layer_delta2 * 1000.0f))) {
+                if (layer_delta1 >= layer_delta3 && layer_delta2 > layer_delta3 && !static_cast<signed int>((layer_delta3 * 1000.0f))) {
                     index = 1;
                 }
             }
-            else
-            {
+            else {
                 index = -1;
             }
         }
     }
 
+    // Calculate footYaw based on player's misses
     switch (player.misses % 3) {
     case 0: //default
-        entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, entity->eyeAngles().y + max_rotation * static_cast<float>(index));
+        entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, eye_yaw + max_rotation * static_cast<float>(index));
         break;
     case 1: //reverse
-        entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, entity->eyeAngles().y + max_rotation * static_cast<float>(-index));
+        entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, eye_yaw + max_rotation * static_cast<float>(-index));
         break;
     case 2: //middle
-        entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, entity->eyeAngles().y);
+        entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, eye_yaw);
         break;
-    default: break;
+    case 3: //new mode 1: use the average of eye_yaw and footYaw 
+        entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, (eye_yaw + entity->getAnimstate()->footYaw) / 2.0f);
+        break;
+    case 4: //new mode 2: use the velocity direction to calculate footYaw
+        Vector velocity = entity->velocity();
+        if (velocity.length2D() > 0.1f) {
+            entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, Helpers::rad2deg(atan2(velocity.y, velocity.x)));
+        }
+    case 5: //new mode 3: use a fixed offset based on the player's index
+        entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, eye_yaw + 45.0f * static_cast<float>(index));
+        break;
+        default:
+        // Handle unexpected values
+        break;
     }
-
 }
 
 bool IsAdjustingBalance(const Animations::Players& player, Entity* entity)
@@ -348,6 +369,7 @@ bool is_breaking_lby(const Animations::Players& player, Entity* entity, Animatio
 
     return false;
 }
+
 float Resolver::resolve_shot(const Animations::Players& player, Entity* entity) {
     /* fix unrestricted shot */
     if (DesyncDetect(entity) == false)
@@ -418,137 +440,160 @@ void Resolver::setup_detect(Animations::Players& player, Entity* entity) {
     entity->getAnimstate()->footYaw = fl_eye_yaw + brute;
 }
 
-Vector calc_angle(const Vector source, const Vector entity_pos) {
-    const Vector delta{ source.x - entity_pos.x, source.y - entity_pos.y, source.z - entity_pos.z };
-    const auto& [x, y, z] = cmd->viewangles;
-    Vector angles{ Helpers::rad2deg(atan(delta.z / hypot(delta.x, delta.y))) - x, Helpers::rad2deg(atan(delta.y / delta.x)) - y, 0.f };
-    if (delta.x >= 0.f)
-        angles.y += 180;
-    return angles;
+// Calculate the angles required to aim from a source position to an entity position
+Vector calculate_aim_angles(const Vector& source_position, const Vector& entity_position, const Vector& view_angles) {
+    // Calculate the delta between the source and entity positions
+    Vector delta = source_position - entity_position;
+
+    // Extract the view angles
+    const auto& [pitch, yaw, roll] = view_angles;
+
+    // Calculate the pitch angle
+    float pitch_angle = Helpers::rad2deg(std::atan2(delta.z, std::hypot(delta.x, delta.y))) - pitch;
+
+    // Calculate the yaw angle
+    float yaw_angle = Helpers::rad2deg(std::atan2(delta.y, delta.x)) - yaw;
+
+    // Adjust the yaw angle if necessary
+    if (delta.x >= 0.f) {
+        yaw_angle += 180.f;
+    }
+
+    // Normalize the yaw angle to the range [-180, 180]
+    yaw_angle = std::remainder(yaw_angle, 360.f);
+    if (yaw_angle > 180.f) {
+        yaw_angle -= 360.f;
+    }
+    else if (yaw_angle < -180.f) {
+        yaw_angle += 360.f;
+    }
+
+    // Return the calculated angles
+    return { pitch_angle, yaw_angle, 0.f };
 }
 
-void Resolver::processMissedShots() noexcept
-{
-    if (!resolver)
-    {
+void Resolver::processMissedShots() noexcept {
+    // Check if resolver is enabled
+    if (!resolver) {
         snapshots.clear();
         return;
     }
 
-    if (!localPlayer)
-    {
+    // Check if local player is valid
+    if (!localPlayer) {
         snapshots.clear();
         return;
     }
 
-    if (snapshots.empty())
+    // Check if snapshots are empty
+    if (snapshots.empty()) {
         return;
+    }
 
-    if (snapshots.front().time == -1) //Didnt get data yet
+    // Check if snapshot data is not available yet
+    if (snapshots.front().time == -1) {
         return;
+    }
 
+    // Get the snapshot data and remove it from the list
     auto snapshot = snapshots.front();
-    snapshots.pop_front(); //got the info no need for this
-    const auto& time = localPlayer->isAlive() ? localPlayer->tickBase() * memory->globalVars->intervalPerTick : memory->globalVars->currenttime;
-    if (fabs(time - snapshot.time) > 1.f)
-    {
-        if (snapshot.gotImpact)
+    snapshots.pop_front();
+
+    // Calculate the current time
+    const auto currentTime = localPlayer->isAlive() ? localPlayer->tickBase() * memory->globalVars->intervalPerTick : memory->globalVars->currenttime;
+
+    // Check if the snapshot is too old
+    if (std::abs(currentTime - snapshot.time) > 1.f) {
+        if (snapshot.gotImpact) {
             Logger::addLog("Missed shot due to ping");
-        else
+        } else {
             Logger::addLog("Missed shot due to server rejection");
+        }
         snapshots.clear();
         return;
     }
-    if (!snapshot.player.gotMatrix)
-        return;
 
-    const auto entity = interfaces->entityList->getEntity(snapshot.playerIndex);
-    if (!entity)
+    // Check if the snapshot has a valid matrix
+    if (!snapshot.player.gotMatrix) {
         return;
+    }
+
+    // Get the entity and model data
+    const auto entity = interfaces->entityList->getEntity(snapshot.playerIndex);
+    if (!entity) {
+        return;
+    }
 
     const Model* model = snapshot.model;
-    if (!model)
+    if (!model) {
         return;
+    }
 
     StudioHdr* hdr = interfaces->modelInfo->getStudioModel(model);
-    if (!hdr)
+    if (!hdr) {
         return;
+    }
 
     StudioHitboxSet* set = hdr->getHitboxSet(0);
-    if (!set)
+    if (!set) {
         return;
+    }
 
-    const auto angle = hitscan::calculateRelativeAngle(snapshot.eyePosition, snapshot.bulletImpact, Vector{ });
-    const auto end = snapshot.bulletImpact + Vector::fromAngle(angle) * 2000.f;
+    // Calculate the relative angle and end position for hitscan
+    const auto angle = hitscan::calculateRelativeAngle(snapshot.eyePosition, snapshot.bulletImpact, Vector{});
+    const auto endPosition = snapshot.bulletImpact + Vector::fromAngle(angle) * 2000.f;
 
+    // Get the matrix data for hitscan
     const auto matrix = snapshot.backtrackRecord <= -1 ? snapshot.player.matrix.data() : snapshot.player.backtrackRecords.at(snapshot.backtrackRecord).matrix;
 
+    // Check for missed shots due to resolver, backtrack, prediction error, or jitter
     bool resolverMissed = false;
-    for (int hitbox = 0; hitbox < Hitboxes::Max; hitbox++)
-    {
-        if (hitscan::hitboxIntersection(matrix, hitbox, set, snapshot.eyePosition, end))
-        {
+    for (int hitbox = 0; hitbox < Hitboxes::Max; hitbox++) {
+        if (hitscan::hitboxIntersection(matrix, hitbox, set, snapshot.eyePosition, endPosition)) {
             resolverMissed = true;
-            std::string missed = std::string("Missed shot on ") + entity->getPlayerName() + std::string(" due to resolver");
-            std::string missedBT = std::string("Missed shot on ") + entity->getPlayerName() + std::string(" due to invalid backtrack tick [") + std::to_string(snapshot.backtrackRecord) + "]";
-            std::string missedPred = std::string("Missed shot on ") + entity->getPlayerName() + std::string(" due to prediction error");
-            std::string missedJitter = std::string("Missed shot on ") + entity->getPlayerName() + std::string(" due to jitter");
-            if (snapshot.backtrackRecord == 1 && config->backtrack.enabled)
-                Logger::addLog(missedJitter);
-            else if (snapshot.backtrackRecord > 1 && config->backtrack.enabled)
-                Logger::addLog(missedBT);
-            else
-                Logger::addLog(missed);
+            std::string missedReason;
+            if (snapshot.backtrackRecord == 1 && config->backtrack.enabled) {
+                missedReason = "jitter";
+            } else if (snapshot.backtrackRecord > 1 && config->backtrack.enabled) {
+                missedReason = "invalid backtrack tick [" + std::to_string(snapshot.backtrackRecord) + "]";
+            } else {
+                missedReason = "resolver";
+            }
+            Logger::addLog("Missed shot on " + entity->getPlayerName() + " due to " + missedReason);
             Animations::setPlayer(snapshot.playerIndex)->misses++;
             break;
         }
     }
-    if (!resolverMissed)
-        Logger::addLog(std::string("Missed shot due to spread"));
+
+    // Log missed shots due to spread
+    if (!resolverMissed) {
+        Logger::addLog("Missed shot due to spread");
+    }
 }
 
 void Resolver::runPreUpdate(Animations::Players player, Entity* entity) noexcept
 {
-    if (!resolver)
+    // Check essential conditions in one line for readability
+    if (!resolver || !entity || !entity->isAlive() || entity->isDormant() || player.chokedPackets <= 0 || snapshots.empty()) {
         return;
+    }
 
-    const auto misses = player.misses;
-    if (!entity || !entity->isAlive())
-        return;
-
-    if (!entity->isDormant())
-        return;
-
-    if (player.chokedPackets <= 0)
-        return;
-
-    if (snapshots.empty())
-        return;
-
+    // Access the snapshot data only after passing initial checks
     auto& [snapshot_player, model, eyePosition, bulletImpact, gotImpact, time, playerIndex, backtrackRecord] = snapshots.front();
+
+    // Execute the main resolving functions
     setup_detect(player, entity);
     resolve_entity(player, entity);
 }
 
 void Resolver::runPostUpdate(Animations::Players player, Entity* entity) noexcept
 {
-    if (!resolver)
+    // Check essential conditions in one line for readability
+    if (!resolver || !entity || !entity->isAlive() || entity->isDormant() || player.chokedPackets <= 0 || snapshots.empty()) {
         return;
+    }
 
-    const auto misses = player.misses;
-    if (!entity || !entity->isAlive())
-        return;
-
-    if (!entity->isDormant())
-        return;
-
-    if (player.chokedPackets <= 0)
-        return;
-
-    if (snapshots.empty())
-        return;
-
-    //auto& [snapshot_player, model, eyePosition, bulletImpact, gotImpact, time, playerIndex, backtrackRecord] = snapshots.front();
+    // Execute the main resolving functions without unnecessary snapshot access
     setup_detect(player, entity);
     resolve_entity(player, entity);
 }
@@ -563,21 +608,25 @@ void Resolver::updateEventListeners(bool forceRemove) noexcept
     };
 
     static ImpactEventListener listener[4];
+    static const char* eventNames[] = {
+        "bullet_impact",
+        "player_hurt",
+        "round_start",
+        "weapon_fire"
+    };
+
     static bool listenerRegistered = false;
 
     if (resolver && !listenerRegistered) {
-        interfaces->gameEventManager->addListener(&listener[0], "bullet_impact");
-        interfaces->gameEventManager->addListener(&listener[1], "player_hurt");
-        interfaces->gameEventManager->addListener(&listener[2], "round_start");
-        interfaces->gameEventManager->addListener(&listener[3], "weapon_fire");
+        for (int i = 0; i < 4; ++i) {
+            interfaces->gameEventManager->addListener(&listener[i], eventNames[i]);
+        }
         listenerRegistered = true;
     }
-
     else if ((!resolver || forceRemove) && listenerRegistered) {
-        interfaces->gameEventManager->removeListener(&listener[0]);
-        interfaces->gameEventManager->removeListener(&listener[1]);
-        interfaces->gameEventManager->removeListener(&listener[2]);
-        interfaces->gameEventManager->removeListener(&listener[3]);
+        for (int i = 0; i < 4; ++i) {
+            interfaces->gameEventManager->removeListener(&listener[i]);
+        }
         listenerRegistered = false;
     }
 }
