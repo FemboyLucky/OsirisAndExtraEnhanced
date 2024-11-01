@@ -4,8 +4,13 @@ This project is based off of : https://github.com/finutz/my-custom-osiris
 
 ### Known Bugs:
 - **Broken tickbase exploit**: Hide shots currently do not work, and double tap functionality is inconsistent.
+- **Enabling hide shots or doubletap breaks fake lag.**
 
-## Latest Update (08.08.2024):
+## Latest Update (10.31.2024):
+- **Improved resolver and logic**
+- **Improved/Reworked animation fix**
+
+## Last update (08.08.2024):
 - Major **Anti-Aimbot update**
 - Added **mediocre defensive check** (defensive anti-aim coming soon)
 - Minor **fake lag update**
